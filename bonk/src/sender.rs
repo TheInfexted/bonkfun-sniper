@@ -40,10 +40,23 @@ pub struct TxSender {
     client: Arc<RpcClient>,
     latest_blockhash: Arc<RwLock<Vec<Hash>>>,
     token_mint: Pubkey,
-    jito_keypair: Keypair,
-    bloxroute_api_key: String,
-    zeroslot_api_key: String,
+    jito_client: Option<jito::Client>,
+    bloxroute_api_key: Option<String>,
+    zeroslot_api_key: Option<String>,
     amount_in: u64,
+    // Pre-computed transaction templates
+    base_instructions: Vec<Instruction>,
+    tip_addresses: TipAddresses,
+    // Cached HTTP clients
+    http_client: reqwest::Client,
+    backup_rpc_client: Arc<RpcClient>,
+}
+
+#[derive(Clone)]
+struct TipAddresses {
+    zeroslot: Pubkey,
+    bloxroute: Pubkey,
+    jito: Pubkey,
 }
 
 impl TxSender {
@@ -51,9 +64,9 @@ impl TxSender {
         keypair: Keypair,
         client: Arc<RpcClient>,
         token_mint: Pubkey,
-        jito_keypair: Keypair,
-        bloxroute_api_key: String,
-        zeroslot_api_key: String,
+        jito_client: Option<jito::Client>,
+        bloxroute_api_key: Option<String>,
+        zeroslot_api_key: Option<String>,
         amount_in: u64,
     ) -> Self {
         // Get initial blockhash
@@ -68,16 +81,130 @@ impl TxSender {
             latest_blockhash.clone(),
         ));
 
+        // Pre-compute base instructions (everything except swap calculation)
+        let base_instructions = Self::build_base_instructions(&keypair, token_mint, amount_in);
+        
+        // Pre-define tip addresses
+        let tip_addresses = TipAddresses {
+            zeroslot: pubkey!("FCjUJZ1qozm1e8romw216qyfQMaaWKxWsuySnumVCCNe"),
+            bloxroute: pubkey!("95cfoy472fcQHaw4tPGBTKpn6ZQnfEPfBgDQx6gcRmRg"),
+            jito: pubkey!("DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh"),
+        };
+        
+        // Create reusable HTTP client with optimized settings
+        let http_client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(5000))
+            .tcp_keepalive(Duration::from_secs(60))
+            .pool_idle_timeout(Duration::from_secs(90))
+            .pool_max_idle_per_host(10)
+            .http2_prior_knowledge()
+            .build()
+            .expect("Failed to create HTTP client");
+            
+        // Pre-create backup RPC client
+        let backup_rpc_client = Arc::new(RpcClient::new_with_commitment(
+            "https://acc.solayer.org".to_string(),
+            CommitmentConfig::processed(),
+        ));
+
         Self {
             keypair,
             client,
             latest_blockhash,
             token_mint,
-            jito_keypair,
+            jito_client,
             bloxroute_api_key,
             zeroslot_api_key,
             amount_in,
+            base_instructions,
+            tip_addresses,
+            http_client,
+            backup_rpc_client,
         }
+    }
+
+    fn build_base_instructions(keypair: &Keypair, token_mint: Pubkey, amount_in: u64) -> Vec<Instruction> {
+        use spl_associated_token_account::instruction::create_associated_token_account_idempotent;
+        
+        let cu_budget = 2_000_000u32;
+        let cu_price = 500_000u64;
+
+        let set_cu_budget_ix = Instruction {
+            program_id: pubkey!("ComputeBudget111111111111111111111111111111"),
+            accounts: vec![AccountMeta::new_readonly(
+                pubkey!("jitodontfront11111111111111111111TrentLover"),
+                false,
+            )],
+            data: {
+                let mut data = vec![2u8]; // SetComputeUnitLimit discriminator
+                data.extend_from_slice(&cu_budget.to_le_bytes());
+                data
+            },
+        };
+
+        let set_cu_price_ix = Instruction {
+            program_id: pubkey!("ComputeBudget111111111111111111111111111111"),
+            accounts: vec![],
+            data: {
+                let mut data = vec![3u8]; // SetComputeUnitPrice discriminator
+                data.extend_from_slice(&cu_price.to_le_bytes());
+                data
+            },
+        };
+
+        let create_ata_base_ix = create_associated_token_account_idempotent(
+            &keypair.pubkey(),
+            &keypair.pubkey(),
+            &swap::WSOL_MINT,
+            &pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"),
+        );
+
+        let create_ata_quote_ix = create_associated_token_account_idempotent(
+            &keypair.pubkey(),
+            &keypair.pubkey(),
+            &token_mint,
+            &pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"),
+        );
+
+        let transfer_to_wsol = system_instruction::transfer(
+            &keypair.pubkey(),
+            &Pubkey::find_program_address(
+                &[
+                    &keypair.pubkey().to_bytes(),
+                    &pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").to_bytes(),
+                    &swap::WSOL_MINT.to_bytes(),
+                ],
+                &pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"),
+            )
+            .0,
+            amount_in,
+        );
+
+        let sync_native_ix = Instruction {
+            program_id: pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"),
+            accounts: vec![AccountMeta::new(
+                Pubkey::find_program_address(
+                    &[
+                        &keypair.pubkey().to_bytes(),
+                        &pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").to_bytes(),
+                        &swap::WSOL_MINT.to_bytes(),
+                    ],
+                    &pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"),
+                )
+                .0,
+                false,
+            )],
+            data: vec![17], // SyncNative instruction discriminator
+        };
+
+        vec![
+            set_cu_budget_ix,
+            set_cu_price_ix,
+            create_ata_base_ix,
+            create_ata_quote_ix,
+            transfer_to_wsol,
+            sync_native_ix,
+        ]
     }
 
     pub async fn blockhash_update_worker(client: Arc<RpcClient>, blockhash: Arc<RwLock<Vec<Hash>>>) {
@@ -100,7 +227,7 @@ impl TxSender {
         }
     }
 
-    pub async fn run_loop(mut self) {
+    pub async fn run_loop(self) {
         info!("Starting tx sender loop");
 
         // let tpu_client = Arc::new(TpuClient::new(
@@ -111,15 +238,6 @@ impl TxSender {
         // )
         // .await.unwrap());
 
-        let jito_keypair = self.jito_keypair;
-
-        let jito_client = jito::get_searcher_client_auth(
-                "https://ny.mainnet.block-engine.jito.wtf",
-                &Arc::new(jito_keypair),
-            )
-            .await
-            .unwrap();
-
         loop {
             buy(
                 self.amount_in,
@@ -128,9 +246,9 @@ impl TxSender {
                 self.latest_blockhash.clone(),
                 self.client.clone(),
                 // tpu_client.clone(),
-                jito_client.clone(),
-                &self.zeroslot_api_key,
-                &self.bloxroute_api_key,
+                self.jito_client.clone(),
+                self.zeroslot_api_key.as_deref(),
+                self.bloxroute_api_key.as_deref(),
             ).await;
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -231,9 +349,9 @@ async fn buy(
     latest_blockhash: Arc<RwLock<Vec<Hash>>>,
     client: Arc<RpcClient>,
     // tpu_client: Arc<TpuClient<QuicPool, QuicConnectionManager, QuicConfig>>,
-    jito_client: jito::Client,
-    zeroslot_api_key: &str,
-    bloxroute_api_key: &str,
+    jito_client: Option<jito::Client>,
+    zeroslot_api_key: Option<&str>,
+    bloxroute_api_key: Option<&str>,
 ) {
     // Pool reserves: 85 SOL and 206,900,000 tokens
     let reserve_sol = 85_000_000_000; // 85 SOL in lamports
@@ -392,15 +510,29 @@ async fn buy(
         );
 
 
-        futures_0slot.push(send_via_0slot(tx_0slot.clone(), &zeroslot_api_key));
-        futures_bloxroute.push(send_via_bloxroute(tx_bloxroute.clone(), &bloxroute_api_key));
+        // Send via 0slot if API key is available
+        if let Some(api_key) = zeroslot_api_key {
+            futures_0slot.push(send_via_0slot(tx_0slot.clone(), api_key));
+        }
+        
+        // Send via BloxRoute if API key is available
+        if let Some(api_key) = bloxroute_api_key {
+            futures_bloxroute.push(send_via_bloxroute(tx_bloxroute.clone(), api_key));
+        }
+        
+        // Always send via RPC
         futures_rpc.push(send_via_rpc(tx_no_tip.clone(), client.clone()));
         futures_rpc.push(send_via_rpc(tx_no_tip.clone(), Arc::new(RpcClient::new_with_commitment(
             "https://acc.solayer.org".to_string(),
             CommitmentConfig::processed(),
         ))));
+        
         // futures_tpu.push(send_via_tpu(tx_no_tip.clone(), tpu_client.clone()));
-        futures_jito.push(send_via_jito(tx_jito.clone(), jito_client.clone()));
+        
+        // Send via Jito if client is available
+        if let Some(client) = jito_client.clone() {
+            futures_jito.push(send_via_jito(tx_jito.clone(), client));
+        }
     }
 
     tokio::join!(

@@ -45,3 +45,5 @@ ENV/
 *.parquet
 *.npy
 *.bin
+/test-ledger
+WARP.md
