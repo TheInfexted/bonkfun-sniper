@@ -41,9 +41,9 @@ pub struct TxSender {
     client: Arc<RpcClient>,
     latest_blockhash: Arc<RwLock<Vec<Hash>>>,
     token_mint: Pubkey,
-    jito_keypair: Keypair,
-    bloxroute_api_key: String,
-    zeroslot_api_key: String,
+    jito_client: Option<jito::Client>,
+    bloxroute_api_key: Option<String>,
+    zeroslot_api_key: Option<String>,
     amount_in: u64,
     // Pre-computed optimizations
     base_instructions: Vec<Instruction>,
@@ -65,9 +65,9 @@ impl TxSender {
         keypair: Keypair,
         client: Arc<RpcClient>,
         token_mint: Pubkey,
-        jito_keypair: Keypair,
-        bloxroute_api_key: String,
-        zeroslot_api_key: String,
+        jito_client: Option<jito::Client>,
+        bloxroute_api_key: Option<String>,
+        zeroslot_api_key: Option<String>,
         amount_in: u64,
     ) -> Self {
         // Get initial blockhash
@@ -125,7 +125,7 @@ impl TxSender {
             client,
             latest_blockhash,
             token_mint,
-            jito_keypair,
+            jito_client,
             bloxroute_api_key,
             zeroslot_api_key,
             amount_in,
@@ -248,7 +248,7 @@ impl TxSender {
     }
 
     pub async fn run_loop(self) {
-        info!("Starting optimized tx sender loop - 50ms intervals");
+        info!("Starting tx sender loop - 50ms intervals");
 
         let mut interval = tokio::time::interval(Duration::from_millis(50)); // 2x faster: 50ms instead of 100ms
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -601,9 +601,9 @@ async fn buy(
     latest_blockhash: Arc<RwLock<Vec<Hash>>>,
     client: Arc<RpcClient>,
     // tpu_client: Arc<TpuClient<QuicPool, QuicConnectionManager, QuicConfig>>,
-    jito_client: jito::Client,
-    zeroslot_api_key: &str,
-    bloxroute_api_key: &str,
+    jito_client: Option<jito::Client>,
+    zeroslot_api_key: Option<&str>,
+    bloxroute_api_key: Option<&str>,
 ) {
     // Pool reserves: 85 SOL and 206,900,000 tokens
     let reserve_sol = 85_000_000_000; // 85 SOL in lamports
@@ -762,15 +762,29 @@ async fn buy(
         );
 
 
-        futures_0slot.push(send_via_0slot(tx_0slot.clone(), &zeroslot_api_key));
-        futures_bloxroute.push(send_via_bloxroute(tx_bloxroute.clone(), &bloxroute_api_key));
+        // Send via 0slot if API key is available
+        if let Some(api_key) = zeroslot_api_key {
+            futures_0slot.push(send_via_0slot(tx_0slot.clone(), api_key));
+        }
+        
+        // Send via BloxRoute if API key is available
+        if let Some(api_key) = bloxroute_api_key {
+            futures_bloxroute.push(send_via_bloxroute(tx_bloxroute.clone(), api_key));
+        }
+        
+        // Always send via RPC
         futures_rpc.push(send_via_rpc(tx_no_tip.clone(), client.clone()));
         futures_rpc.push(send_via_rpc(tx_no_tip.clone(), Arc::new(RpcClient::new_with_commitment(
             "https://acc.solayer.org".to_string(),
             CommitmentConfig::processed(),
         ))));
+        
         // futures_tpu.push(send_via_tpu(tx_no_tip.clone(), tpu_client.clone()));
-        futures_jito.push(send_via_jito(tx_jito.clone(), jito_client.clone()));
+        
+        // Send via Jito if client is available
+        if let Some(client) = jito_client.clone() {
+            futures_jito.push(send_via_jito(tx_jito.clone(), client));
+        }
     }
 
     tokio::join!(
