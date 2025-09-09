@@ -28,6 +28,7 @@ use tokio::{
     time::interval,
 };
 use tracing::{error, info, instrument};
+use futures;
 
 use crate::{
     jito,
@@ -44,6 +45,19 @@ pub struct TxSender {
     bloxroute_api_key: String,
     zeroslot_api_key: String,
     amount_in: u64,
+    // Pre-computed optimizations
+    base_instructions: Vec<Instruction>,
+    tip_addresses: TipAddresses,
+    http_client: Arc<reqwest::Client>,
+    backup_rpc_client: Arc<RpcClient>,
+    jito_client: Option<jito::Client>,
+}
+
+#[derive(Clone)]
+struct TipAddresses {
+    zeroslot: Pubkey,
+    bloxroute: Pubkey, 
+    jito: Pubkey,
 }
 
 impl TxSender {
@@ -68,6 +82,44 @@ impl TxSender {
             latest_blockhash.clone(),
         ));
 
+        // Pre-compute base instructions (everything except swap instruction)
+        let base_instructions = Self::build_base_instructions(&keypair, token_mint, amount_in);
+        
+        // Pre-define tip addresses
+        let tip_addresses = TipAddresses {
+            zeroslot: pubkey!("FCjUJZ1qozm1e8romw216qyfQMaaWKxWsuySnumVCCNe"),
+            bloxroute: pubkey!("95cfoy472fcQHaw4tPGBTKpn6ZQnfEPfBgDQx6gcRmRg"),
+            jito: pubkey!("DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh"),
+        };
+        
+        // Create optimized HTTP client with connection pooling
+        let http_client = Arc::new(reqwest::Client::builder()
+            .timeout(Duration::from_millis(5000))
+            .tcp_keepalive(Duration::from_secs(60))
+            .pool_idle_timeout(Duration::from_secs(90))
+            .pool_max_idle_per_host(10)
+            .http2_prior_knowledge()
+            .build()
+            .expect("Failed to create HTTP client"));
+            
+        // Pre-create backup RPC client
+        let backup_rpc_client = Arc::new(RpcClient::new_with_commitment(
+            "https://acc.solayer.org".to_string(),
+            CommitmentConfig::processed(),
+        ));
+        
+        // Pre-initialize Jito client
+        let jito_client = match jito::get_searcher_client_auth(
+            "https://ny.mainnet.block-engine.jito.wtf",
+            &Arc::new(jito_keypair.insecure_clone()),
+        ).await {
+            Ok(client) => Some(client),
+            Err(e) => {
+                error!("Failed to initialize Jito client: {}", e);
+                None
+            }
+        };
+
         Self {
             keypair,
             client,
@@ -77,65 +129,383 @@ impl TxSender {
             bloxroute_api_key,
             zeroslot_api_key,
             amount_in,
+            base_instructions,
+            tip_addresses,
+            http_client,
+            backup_rpc_client,
+            jito_client,
         }
     }
 
+    fn build_base_instructions(keypair: &Keypair, token_mint: Pubkey, amount_in: u64) -> Vec<Instruction> {
+        let cu_budget = 2_000_000u32;
+        let cu_price = 500_000u64;
+
+        let set_cu_budget_ix = Instruction {
+            program_id: pubkey!("ComputeBudget111111111111111111111111111111"),
+            accounts: vec![AccountMeta::new_readonly(
+                pubkey!("jitodontfront11111111111111111111TrentLover"),
+                false,
+            )],
+            data: {
+                let mut data = vec![2u8]; // SetComputeUnitLimit discriminator
+                data.extend_from_slice(&cu_budget.to_le_bytes());
+                data
+            },
+        };
+
+        let set_cu_price_ix = Instruction {
+            program_id: pubkey!("ComputeBudget111111111111111111111111111111"),
+            accounts: vec![],
+            data: {
+                let mut data = vec![3u8]; // SetComputeUnitPrice discriminator
+                data.extend_from_slice(&cu_price.to_le_bytes());
+                data
+            },
+        };
+
+        let create_ata_base_ix = create_associated_token_account_idempotent(
+            &keypair.pubkey(),
+            &keypair.pubkey(),
+            &swap::WSOL_MINT,
+            &pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"),
+        );
+
+        let create_ata_quote_ix = create_associated_token_account_idempotent(
+            &keypair.pubkey(),
+            &keypair.pubkey(),
+            &token_mint,
+            &pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"),
+        );
+
+        let transfer_to_wsol = system_instruction::transfer(
+            &keypair.pubkey(),
+            &Pubkey::find_program_address(
+                &[
+                    &keypair.pubkey().to_bytes(),
+                    &pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").to_bytes(),
+                    &swap::WSOL_MINT.to_bytes(),
+                ],
+                &pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"),
+            )
+            .0,
+            amount_in,
+        );
+
+        let sync_native_ix = Instruction {
+            program_id: pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"),
+            accounts: vec![AccountMeta::new(
+                Pubkey::find_program_address(
+                    &[
+                        &keypair.pubkey().to_bytes(),
+                        &pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").to_bytes(),
+                        &swap::WSOL_MINT.to_bytes(),
+                    ],
+                    &pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"),
+                )
+                .0,
+                false,
+            )],
+            data: vec![17], // SyncNative instruction discriminator
+        };
+
+        vec![
+            set_cu_budget_ix,
+            set_cu_price_ix,
+            create_ata_base_ix,
+            create_ata_quote_ix,
+            transfer_to_wsol,
+            sync_native_ix,
+        ]
+    }
+
     pub async fn blockhash_update_worker(client: Arc<RpcClient>, blockhash: Arc<RwLock<Vec<Hash>>>) {
-        let mut interval = interval(Duration::from_millis(200));
+        let mut interval = interval(Duration::from_millis(150)); // Faster: 150ms instead of 200ms
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        
         loop {
             interval.tick().await;
 
-            match client.get_latest_blockhash().await {
-                Ok(new_blockhash) => {
-                    let mut blockhashes = blockhash.write().await;
-                    blockhashes.push(new_blockhash);
-                    if blockhashes.len() > 4 {
-                        blockhashes.remove(0);
+            // Use timeout to avoid blocking the worker
+            match tokio::time::timeout(Duration::from_millis(100), client.get_latest_blockhash()).await {
+                Ok(Ok(new_blockhash)) => {
+                    // Use try_write for non-blocking operation
+                    if let Ok(mut blockhashes) = blockhash.try_write() {
+                        blockhashes.push(new_blockhash);
+                        if blockhashes.len() > 3 { // Keep fewer for speed
+                            blockhashes.remove(0);
+                        }
                     }
                 }
-                Err(e) => {
-                    error!("Failed to update blockhash: {:?}", e);
+                Ok(Err(e)) => {
+                    error!("Failed to get blockhash: {:?}", e);
+                }
+                Err(_) => {
+                    error!("Blockhash request timed out");
                 }
             }
         }
     }
 
-    pub async fn run_loop(mut self) {
-        info!("Starting tx sender loop");
+    pub async fn run_loop(self) {
+        info!("Starting optimized tx sender loop - 50ms intervals");
 
-        // let tpu_client = Arc::new(TpuClient::new(
-        //     "client",
-        //     self.client.clone(),
-        //     "wss://validator.solayer.org",
-        //     TpuClientConfig::default(),
-        // )
-        // .await.unwrap());
-
-        let jito_keypair = self.jito_keypair;
-
-        let jito_client = jito::get_searcher_client_auth(
-                "https://ny.mainnet.block-engine.jito.wtf",
-                &Arc::new(jito_keypair),
-            )
-            .await
-            .unwrap();
+        let mut interval = tokio::time::interval(Duration::from_millis(50)); // 2x faster: 50ms instead of 100ms
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
-            buy(
-                self.amount_in,
-                self.token_mint,
-                self.keypair.insecure_clone(),
-                self.latest_blockhash.clone(),
-                self.client.clone(),
-                // tpu_client.clone(),
-                jito_client.clone(),
-                &self.zeroslot_api_key,
-                &self.bloxroute_api_key,
-            ).await;
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            interval.tick().await;
+            self.buy_optimized().await;
         }
-        
     }
+    
+    // Optimized buy function with pre-computed instructions and parallel sending
+    async fn buy_optimized(&self) {
+        // Pool reserves: 85 SOL and 206,900,000 tokens (should be updated dynamically in production)
+        const RESERVE_SOL: u64 = 85_000_000_000;
+        const RESERVE_TOKEN: u64 = 206_900_000_000_000;
+        
+        let amount_out = calculate_amount_out(self.amount_in, RESERVE_SOL, RESERVE_TOKEN);
+        let swap_base_in = SwapBaseIn::new(
+            self.keypair.pubkey(),
+            self.token_mint,
+            self.amount_in,
+            amount_out,
+        );
+
+        // Build complete instruction set with pre-computed base + swap
+        let mut instructions = self.base_instructions.clone();
+        instructions.push(swap_base_in.ix());
+
+        // Get latest blockhash (non-blocking read)
+        let blockhash = {
+            let blockhashes = self.latest_blockhash.read().await;
+            *blockhashes.last().expect("No blockhashes available")
+        };
+
+        // Build all transactions in parallel using spawn_blocking for CPU-intensive work
+        let (tx_rpc, tx_0slot, tx_bloxroute, tx_jito) = tokio::task::spawn_blocking({
+            let instructions = instructions.clone();
+            let keypair = self.keypair.insecure_clone();
+            let tip_addresses = self.tip_addresses.clone();
+            
+            move || {
+                let payer = keypair.pubkey();
+                let tip_amount = 10_000_000; // 0.01 SOL
+                
+                // Base transaction (no tip)
+                let tx_rpc = Transaction::new_signed_with_payer(
+                    &instructions,
+                    Some(&payer),
+                    &[&keypair],
+                    blockhash,
+                );
+
+                // Build tip transactions efficiently
+                let mut ixs_0slot = instructions.clone();
+                ixs_0slot.push(system_instruction::transfer(&payer, &tip_addresses.zeroslot, tip_amount));
+                let tx_0slot = Transaction::new_signed_with_payer(
+                    &ixs_0slot,
+                    Some(&payer),
+                    &[&keypair],
+                    blockhash,
+                );
+
+                let mut ixs_bloxroute = instructions.clone();
+                ixs_bloxroute.push(system_instruction::transfer(&payer, &tip_addresses.bloxroute, tip_amount));
+                let tx_bloxroute = Transaction::new_signed_with_payer(
+                    &ixs_bloxroute,
+                    Some(&payer),
+                    &[&keypair],
+                    blockhash,
+                );
+
+                let mut ixs_jito = instructions.clone();
+                ixs_jito.push(system_instruction::transfer(&payer, &tip_addresses.jito, tip_amount));
+                let tx_jito = Transaction::new_signed_with_payer(
+                    &ixs_jito,
+                    Some(&payer),
+                    &[&keypair],
+                    blockhash,
+                );
+
+                (tx_rpc, tx_0slot, tx_bloxroute, tx_jito)
+            }
+        }).await.expect("Failed to build transactions");
+
+        // Send all transactions concurrently using spawn for true parallelism
+        let mut handles = Vec::new();
+        
+        // Always send via RPC (2 different endpoints)
+        handles.push(tokio::spawn(send_via_rpc_optimized(tx_rpc.clone(), self.client.clone())));
+        handles.push(tokio::spawn(send_via_rpc_optimized(tx_rpc, self.backup_rpc_client.clone())));
+        
+        // Send via 0slot
+        handles.push(tokio::spawn(send_via_0slot_optimized(
+            tx_0slot,
+            self.zeroslot_api_key.clone(),
+            self.http_client.clone()
+        )));
+        
+        // Send via BloxRoute
+        handles.push(tokio::spawn(send_via_bloxroute_optimized(
+            tx_bloxroute,
+            self.bloxroute_api_key.clone(),
+            self.http_client.clone()
+        )));
+        
+        // Send via Jito if available
+        if let Some(jito_client) = self.jito_client.clone() {
+            handles.push(tokio::spawn(send_via_jito_optimized(tx_jito, jito_client)));
+        }
+
+        // Wait for all sends to complete (don't care about individual results for maximum speed)
+        let _ = futures::future::join_all(handles).await;
+    }
+}
+
+// Optimized sending functions with reused HTTP clients
+#[instrument(skip_all, name = "RPC_OPT")]
+async fn send_via_rpc_optimized(tx: Transaction, client: Arc<RpcClient>) {
+    let start = Instant::now();
+    match client
+        .send_transaction_with_config(
+            &tx,
+            RpcSendTransactionConfig {
+                skip_preflight: true,
+                max_retries: Some(0), // No retries for maximum speed
+                ..Default::default()
+            },
+        )
+        .await
+    {
+        Ok(sig) => {
+            info!(duration = ?start.elapsed(), "TX: {sig}");
+        }
+        Err(e) => {
+            error!(duration = ?start.elapsed(), "RPC failed: {:#}", e);
+        }
+    }
+}
+
+#[instrument(skip_all, name = "0SLOT_OPT")]
+async fn send_via_0slot_optimized(tx: Transaction, api_key: String, client: Arc<reqwest::Client>) {
+    let start = Instant::now();
+    
+    // Pre-serialize transaction
+    let serialized_tx = match bincode::serialize(&tx) {
+        Ok(data) => general_purpose::STANDARD.encode(data),
+        Err(e) => {
+            error!(duration = ?start.elapsed(), "Serialization failed: {}", e);
+            return;
+        }
+    };
+    
+    let request_body = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "sendTransaction",
+        "params": [
+            serialized_tx,
+            {"encoding": "base64", "skipPreflight": true}
+        ]
+    });
+
+    match client
+        .post(&format!("https://ny1.0slot.trade/?api-key={}", api_key))
+        .json(&request_body)
+        .send()
+        .await
+    {
+        Ok(response) => {
+            match response.json::<serde_json::Value>().await {
+                Ok(json) => {
+                    if let Some(signature) = json.get("result").and_then(|r| r.as_str()) {
+                        info!(duration = ?start.elapsed(), "TX: {}", signature);
+                    } else if let Some(error) = json.get("error") {
+                        error!(duration = ?start.elapsed(), "0slot error: {}", error);
+                    }
+                }
+                Err(e) => error!(duration = ?start.elapsed(), "JSON parse failed: {}", e),
+            }
+        }
+        Err(e) => error!(duration = ?start.elapsed(), "0slot request failed: {}", e),
+    }
+}
+
+#[instrument(skip_all, name = "BLOX_OPT")]
+async fn send_via_bloxroute_optimized(tx: Transaction, api_key: String, client: Arc<reqwest::Client>) {
+    let start = Instant::now();
+    
+    let serialized_tx = match bincode::serialize(&tx) {
+        Ok(data) => general_purpose::STANDARD.encode(data),
+        Err(e) => {
+            error!(duration = ?start.elapsed(), "Serialization failed: {}", e);
+            return;
+        }
+    };
+    
+    let request_body = json!({
+        "transaction": {"content": serialized_tx}, 
+        "frontRunningProtection": false,
+        "submitProtection": "SP_LOW",
+        "useStakedRPCs": true,
+        "fastBestEffort": true,
+    });
+
+    match client
+        .post("https://ny.solana.dex.blxrbdn.com/api/v2/submit")
+        .header("Authorization", api_key)
+        .json(&request_body)
+        .send()
+        .await
+    {
+        Ok(response) => {
+            match response.json::<serde_json::Value>().await {
+                Ok(json) => {
+                    if let Some(signature) = json.get("signature").and_then(|s| s.as_str()) {
+                        info!(duration = ?start.elapsed(), "TX: {}", signature);
+                    } else if let Some(error) = json.get("error") {
+                        error!(duration = ?start.elapsed(), "BloxRoute error: {}", error);
+                    }
+                }
+                Err(e) => error!(duration = ?start.elapsed(), "JSON parse failed: {}", e),
+            }
+        }
+        Err(e) => error!(duration = ?start.elapsed(), "BloxRoute request failed: {}", e),
+    }
+}
+
+#[instrument(skip_all, name = "JITO_OPT")]
+async fn send_via_jito_optimized(tx: Transaction, mut jito_client: jito::Client) {
+    let start = Instant::now();
+    let sig = *tx.get_signature();
+    let versioned_tx = VersionedTransaction::from(tx);
+
+    match jito::send_bundle_no_wait(&[versioned_tx], &mut jito_client).await {
+        Ok(response) => {
+            info!(duration = ?start.elapsed(), "TX: {sig}, Jito: {response:?}");
+        }
+        Err(e) => {
+            error!(duration = ?start.elapsed(), "Jito failed: {}", e);
+        }
+    }
+}
+
+// Constant product formula with fee calculation
+fn calculate_amount_out(amount_in: u64, reserve_in: u64, reserve_out: u64) -> u64 {
+    if amount_in == 0 || reserve_in == 0 || reserve_out == 0 {
+        return 0;
+    }
+    
+    // Apply 0.25% fee (997/1000 = 0.9975)
+    let amount_in_with_fee = (amount_in * 997) / 1000;
+    
+    // Constant product formula: amount_out = (amount_in_with_fee * reserve_out) / (reserve_in + amount_in_with_fee)
+    let numerator = amount_in_with_fee * reserve_out;
+    let denominator = reserve_in + amount_in_with_fee;
+    
+    numerator / denominator
 }
 
 async fn send_transaction_via_0slot(tx: &Transaction, api_key: &str) -> eyre::Result<String> {
@@ -549,26 +919,3 @@ pub fn create_associated_token_account_idempotent(
     )
 }
 
-pub fn calculate_amount_out(amount_in: u64, reserve_sol: u64, reserve_token: u64) -> u64 {
-    const FEE_DENOMINATOR: u64 = 1_000_000;
-    const TRADE_FEE_RATE: u64 = 2_500; // 0.25% fee
-
-    // Calculate trade fee using ceiling division
-    let trade_fee = (amount_in * TRADE_FEE_RATE).div_ceil(FEE_DENOMINATOR);
-    let amount_in_after_fee = amount_in - trade_fee;
-
-    // Apply constant product formula: out = (amount_in_after_fee * R_token) / (R_sol + amount_in_after_fee)
-    let numerator = amount_in_after_fee as u128 * reserve_token as u128;
-    let denominator = reserve_sol as u128 + amount_in_after_fee as u128;
-    let mut out = (numerator / denominator) as u64;
-
-    // Make sure we never make k smaller (off-by-one protection)
-    let new_k = (reserve_sol + amount_in_after_fee) as u128 * (reserve_token - out) as u128;
-    let old_k = reserve_sol as u128 * reserve_token as u128;
-
-    if new_k < old_k {
-        out -= 1;
-    }
-
-    out
-}

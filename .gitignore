@@ -45,3 +45,6 @@ ENV/
 *.parquet
 *.npy
 *.bin
+/test-ledger
+WARP.md
+performance_improvements.md
