@@ -13,7 +13,6 @@ use solana_sdk::{
     pubkey::Pubkey,
 };
 use std::{str::FromStr, sync::Arc};
-use tokio::sync::mpsc;
 
 use crate::sender::TxSender;
 
