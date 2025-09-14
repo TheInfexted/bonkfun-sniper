@@ -9,7 +9,6 @@ use solana_client::{
     nonblocking::{rpc_client::RpcClient, tpu_client::TpuClient},
     rpc_client::SerializableTransaction,
     rpc_config::RpcSendTransactionConfig,
-    tpu_client::TpuClientConfig,
 };
 use solana_program::pubkey;
 use solana_quic_client::{QuicConfig, QuicConnectionManager, QuicPool};
@@ -24,7 +23,7 @@ use solana_sdk::{
 };
 use solana_system_interface::instruction as system_instruction;
 use tokio::{
-    sync::{RwLock, mpsc},
+    sync::RwLock,
     time::interval,
 };
 use tracing::{error, info, instrument};
@@ -33,7 +32,6 @@ use futures;
 use crate::{
     jito,
     swap::{self, SwapBaseIn},
-    utils,
 };
 
 pub struct TxSender {
@@ -50,7 +48,6 @@ pub struct TxSender {
     tip_addresses: TipAddresses,
     http_client: Arc<reqwest::Client>,
     backup_rpc_client: Arc<RpcClient>,
-    jito_client: Option<jito::Client>,
 }
 
 #[derive(Clone)]
@@ -108,17 +105,7 @@ impl TxSender {
             CommitmentConfig::processed(),
         ));
         
-        // Pre-initialize Jito client
-        let jito_client = match jito::get_searcher_client_auth(
-            "https://ny.mainnet.block-engine.jito.wtf",
-            &Arc::new(jito_keypair.insecure_clone()),
-        ).await {
-            Ok(client) => Some(client),
-            Err(e) => {
-                error!("Failed to initialize Jito client: {}", e);
-                None
-            }
-        };
+        // Use provided Jito client or None
 
         Self {
             keypair,
@@ -133,7 +120,6 @@ impl TxSender {
             tip_addresses,
             http_client,
             backup_rpc_client,
-            jito_client,
         }
     }
 
@@ -340,19 +326,23 @@ impl TxSender {
         handles.push(tokio::spawn(send_via_rpc_optimized(tx_rpc.clone(), self.client.clone())));
         handles.push(tokio::spawn(send_via_rpc_optimized(tx_rpc, self.backup_rpc_client.clone())));
         
-        // Send via 0slot
-        handles.push(tokio::spawn(send_via_0slot_optimized(
-            tx_0slot,
-            self.zeroslot_api_key.clone(),
-            self.http_client.clone()
-        )));
+        // Send via 0slot if API key is available
+        if let Some(api_key) = &self.zeroslot_api_key {
+            handles.push(tokio::spawn(send_via_0slot_optimized(
+                tx_0slot,
+                api_key.clone(),
+                self.http_client.clone()
+            )));
+        }
         
-        // Send via BloxRoute
-        handles.push(tokio::spawn(send_via_bloxroute_optimized(
-            tx_bloxroute,
-            self.bloxroute_api_key.clone(),
-            self.http_client.clone()
-        )));
+        // Send via BloxRoute if API key is available
+        if let Some(api_key) = &self.bloxroute_api_key {
+            handles.push(tokio::spawn(send_via_bloxroute_optimized(
+                tx_bloxroute,
+                api_key.clone(),
+                self.http_client.clone()
+            )));
+        }
         
         // Send via Jito if available
         if let Some(jito_client) = self.jito_client.clone() {
