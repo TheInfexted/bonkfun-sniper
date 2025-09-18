@@ -236,7 +236,7 @@ impl TxSender {
     pub async fn run_loop(self) {
         info!("Starting tx sender loop - 50ms intervals");
 
-        let mut interval = tokio::time::interval(Duration::from_millis(1000)); // 1 second for free tier testing
+        let mut interval = tokio::time::interval(Duration::from_millis(1000)); 
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
